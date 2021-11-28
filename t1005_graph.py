@@ -11,25 +11,72 @@ _unnamed_graph_var_prefix = 'graph_var_'
 _graph_output_prefix = 'output_'
 _node_derivative_prefix = 'NODE_'
 _graph_derivative_prefix = "GRAPH_"
+_graph_constant_prefix = "G_CONSTANT_"
+_graph_unused_prefix = "G_UNUSED_"
 _built_in_name_sub_strings = [_sympy_var_prefix, _unnamed_graph_var_prefix, _graph_output_prefix]
 
 _indent = "  "
 
 
-def _decorate_function_name_with_derivatives(function_name, add_first_order_derivative=False,
-                                             add_second_order_derivative=False):
-    mask = [add_first_order_derivative, add_second_order_derivative]
-    titles = ['First', 'Second']
-    if any(mask):
-        result = function_name
-        result += 'With'
-        for i in range(len(mask)):
-            if mask[i]:
-                result += titles[i]
-        result += 'OrderDerivatives'
-        return result
+def _full_output_channels_with_derivatives(
+        in_dim: int,
+        out_dim: int,
+        enable_1st_order_derivative: bool = False,
+        enable_2nd_order_derivative: bool = False) -> List[Tuple]:
+    """
+    :param in_dim: input dimension
+    :param out_dim: output dimension
+    :param enable_1st_order_derivative:
+    :param enable_2nd_order_derivative:
+    :return: tuple of int representing the order and the channel of the output:
+    (i,) Out[i].
+    (i,j) d_Out[i]_d_In[j]
+    (i,j,k) d2_Out[i]_d_In[j]_d_In[k]
+    """
+    #
+    channels = []
+
+    for i in range(out_dim):
+        channels.append((i,))
+
+    if enable_1st_order_derivative:
+        for i in range(out_dim):
+            for j in range(in_dim):
+                channels.append((i, j))
+
+    if enable_2nd_order_derivative:
+        for i in range(out_dim):
+            for j in range(in_dim):
+                for k in range(j, in_dim):
+                    channels.append((i, j, k))
+
+    return channels
+
+
+def _get_channel_name(output_and_input_names: Tuple):
+    """
+
+    :param output_and_input_names: a tuple with length 1,2, or 3
+    :return:
+    (out,) out
+    (out,in1) D_out_D_in1
+    (out,in1,in2) D2_out_D_in1_D_in2
+    """
+    # in case some uses list
+    names = tuple(output_and_input_names)
+
+    l = len(names)
+
+    assert all([_is_valid_lower_case_cpp_name(name) for name in names]), "_get_channel_name: invalid input name."
+
+    if l == 1:
+        return names[0]
+    elif l == 2:
+        return "D_%s_D_%s" % names
+    elif l == 3:
+        return "D2_%s_D_%s_D_%s" % names
     else:
-        return function_name
+        assert False, "_get_channel_name: invalid input length."
 
 
 def _is_valid_cpp_name(cpp_name: str):
@@ -38,6 +85,19 @@ def _is_valid_cpp_name(cpp_name: str):
         if (count > 0 and c in _number_chars) or \
                 c in _lower_alphabet_chars or \
                 c in _upper_alphabet_chars or \
+                c == '_':
+            pass
+        else:
+            return False
+        count += 1
+    return count > 0
+
+
+def _is_valid_lower_case_cpp_name(cpp_name: str):
+    count = 0
+    for c in cpp_name:
+        if (count > 0 and c in _number_chars) or \
+                c in _lower_alphabet_chars or \
                 c == '_':
             pass
         else:
@@ -69,7 +129,16 @@ class OptimizedCXX11Printer(CXX11CodePrinter):
 class Variable:
     # rear can convert into front, vise NOT versa
     # TODO(): Consider whether it is possible that one claim ArrayXd var = 1.0;
-    var_types = ['ArrayXd', 'double', 'float', 'int']
+    # numerical_var_types = ['ArrayXd', 'double', 'float', 'int']
+    # numerical_var_types_set = set(numerical_var_types)
+
+    # A more complex type can be initialized from a less complex one.
+    # types with equal complexity are inter-tranferable.
+    numerical_var_type_complexity = {'int': 1,
+                                     'float': 2,
+                                     'double': 3,
+                                     'ArrayXd': 4}
+
     var_types_not_need_const_reference = ['double', 'int']
     default_var_type = 'double'
 
@@ -121,7 +190,7 @@ class Variable:
 
     def defined_as_state_input(self, var_type: str = 'double'):
         assert self.type is self.TYPE_UN_DEFINED, "re definition not allowed"
-        assert var_type in self.var_types, "Invalid type: %s" % var_type
+        assert self.is_numerical_var_type(var_type), "Invalid type: %s" % var_type
 
         self.type = self.TYPE_STATE_INPUT
         self.var_type = var_type
@@ -133,7 +202,7 @@ class Variable:
         :return:
         """
         assert self.type is self.TYPE_UN_DEFINED, "re definition not allowed"
-        assert var_type in self.var_types, "Invalid type: %s" % var_type
+        assert self.is_numerical_var_type(var_type), "Invalid type: %s" % var_type
 
         self.value = value
         self.type = self.TYPE_CONSTANT
@@ -145,7 +214,7 @@ class Variable:
         :return:
         """
         assert self.type is self.TYPE_UN_DEFINED, "re definition not allowed"
-        assert var_type in self.var_types, "Invalid type: %s" % var_type
+        assert _is_valid_cpp_name(var_type), "Invalid type: %s" % var_type
 
         self.type = self.TYPE_CONFIG_INPUT
         self.var_type = var_type
@@ -160,7 +229,7 @@ class Variable:
         :return:
         """
         assert self.type is self.TYPE_UN_DEFINED, "re definition not allowed"
-        assert var_type in self.var_types, "Invalid type: %s" % var_type
+        assert self.is_numerical_var_type(var_type), "Invalid type: %s" % var_type
 
         input_types = [input_variable.type for input_variable in inputs]
         assert Variable.TYPE_UN_DEFINED not in input_types
@@ -178,20 +247,38 @@ class Variable:
         self.var_type = var_type
 
     @classmethod
-    def infer_combined_type(cls, var_type_list: List[str]):
-        if not var_type_list:
-            return Variable.default_var_type
+    def infer_combined_var_type(cls, var_type_list: List[str]):
 
-        var_type_indices = {cls.var_types[i]: i for i in range(len(cls.var_types))}
-        min_index = len(cls.var_types) - 1
+        combined = None
+
         for var_type in var_type_list:
-            assert var_type in var_type_indices.keys()
-            min_index = min(min_index, var_type_indices[var_type])
+            if var_type not in cls.numerical_var_type_complexity:
+                continue
+            if combined is None:
+                combined = var_type
+            else:
+                if cls.numerical_var_type_complexity[var_type] > cls.numerical_var_type_complexity[combined]:
+                    combined = var_type
 
-        return cls.var_types[min_index]
+        return combined
+
+    @classmethod
+    def is_transferable(cls, from_type, to_type):
+        if from_type not in cls.numerical_var_type_complexity:
+            return False
+
+        if to_type not in cls.numerical_var_type_complexity:
+            return False
+
+        return cls.numerical_var_type_complexity[from_type] <= cls.numerical_var_type_complexity[to_type]
+
+    @classmethod
+    def is_numerical_var_type(cls, var_type):
+        return var_type in cls.numerical_var_type_complexity
 
     @classmethod
     def const_reference(cls, var_type: str):
+        assert _is_valid_cpp_name(var_type)
         if var_type in cls.var_types_not_need_const_reference:
             return var_type
         else:
@@ -230,13 +317,9 @@ class Variable:
         return _SymPyOperatorFunctions.sympy_div(other, self)
 
 
-class FunctionContext:
+class Context:
     """
-    Function context is all what we need for a function action to be defined.
-
-    FunctionContext determines the type, var_type and the name of the input and outputs.
-
-    It skips those zero/trivial outputs.
+    Function context specifies the major input output action.
 
     For how to call the function, it depends on the class.
     """
@@ -245,121 +328,118 @@ class FunctionContext:
         self.input_variables = inputs
         self.output_variables = outputs
 
-    @staticmethod
-    def first_order_derivative_name(out_name, in_name):
-        # We guaranteed that out_name, in_name are lower case in graph.
-        return "D_%s_D_%s" % (out_name, in_name)
 
-    @staticmethod
-    def second_order_derivative_name(out_name, in_name_1, in_name_2):
-        # We guaranteed that out_name, in_name are lower case in graph.
-        return "D2_%s_D_%s_D_%s" % (
-            out_name,
-            in_name_1,
-            in_name_2)
+class Option:
+    def __init__(self,
+                 enable_1st_order_derivative: bool = False,
+                 enable_2nd_order_derivative: bool = False):
+        self.enable_1st_order_derivative = enable_1st_order_derivative
+        self.enable_2nd_order_derivative = enable_2nd_order_derivative
 
-    # To provide mutual agreement on the outputs of function
-    def get_first_order_derivatives_info(self):
+    def __eq__(self, other: "Option"):
+        return all([
+            self.enable_1st_order_derivative == other.enable_1st_order_derivative,
+            self.enable_2nd_order_derivative == other.enable_2nd_order_derivative
+        ])
+
+    def decorate(self, function_name: str):
+        assert _is_valid_cpp_name(function_name)
+        mask = [self.enable_1st_order_derivative, self.enable_2nd_order_derivative]
+        titles = ['First', 'Second']
+
+        result = function_name
+        if any(mask):
+            result += 'With'
+            for i in range(len(mask)):
+                if mask[i]:
+                    result += titles[i]
+            result += 'OrderDerivatives'
+
+        # TODO: other options.
+
+        return result
+
+
+# options to be considered during code generation.
+_all_options = [
+    Option(False, False),
+    Option(True, False),
+    Option(True, True),
+]
+
+
+class FullContext:
+    def __init__(self, context: Context,
+                 option: Option):
+        self.context = context
+        self.option = option
+        # and other options maybe
+
+        self.zero_order_channels: List[Tuple[int]] = []
+        self.first_order_channels: List[Tuple[int, int]] = []
+        self.second_order_channels: List[Tuple[int, int, int]] = []
+        self._init_output_channels()
+
+    def _init_output_channels(self):
         """
-        :return: a list of tuple:
-         ((output_idx: int, input_idx: int), node_derivative_name: str, node_derivative_type: str)
+        keep only the differentiable output channels
+         0 order non-differentiable also kept.
+        :return: List[Tuple]
         """
-        # assume output types are correctly given.
-        # When given output var types, and input var types, is it possible to determine derivative types?
-        out_dim = len(self.output_variables)
-        in_dim = len(self.input_variables)
-        results = []
+        out_dim = len(self.context.output_variables)
+        in_dim = len(self.context.input_variables)
 
-        for i in range(out_dim):
-            if not self.output_variables[i].is_differentiable():
+        full_output_channels = _full_output_channels_with_derivatives(in_dim, out_dim,
+                                                                      self.option.enable_1st_order_derivative,
+                                                                      self.option.enable_2nd_order_derivative)
+
+        for channel in full_output_channels:
+            # keep only the differentiable output channels
+            # 0 order non-differentiable also kept.
+            should_avoid_channel = False
+            if len(channel) > 1:
+                if not self.context.output_variables[channel[0]].is_differentiable():
+                    should_avoid_channel = True
+
+                for i in range(1, len(channel)):
+                    if not self.context.input_variables[channel[i]].is_differentiable():
+                        should_avoid_channel = True
+            else:
+                # 0 order channel always kept.
+                pass
+            if should_avoid_channel:
                 continue
-            for j in range(in_dim):
-                if not self.input_variables[j].is_differentiable():
-                    continue
-                node_derivative_name = \
-                    _node_derivative_prefix + self.first_order_derivative_name(
-                        self.output_variables[i].nick_name, self.input_variables[j].nick_name)
-                node_derivative_type = self.output_variables[i].var_type
 
-                results.append(((i, j), node_derivative_name, node_derivative_type))
+            if len(channel) == 1:
+                self.zero_order_channels.append(channel)
+            elif len(channel) == 2:
+                self.first_order_channels.append(channel)
+            elif len(channel) == 3:
+                self.second_order_channels.append(channel)
 
-        return results
+    def get_output_channels(self):
+        return self.zero_order_channels + \
+               self.first_order_channels + \
+               self.second_order_channels
 
-    # To provide mutual agreement on the outputs of function
-    def get_second_order_derivatives_info(self):
-        """
-        :return: a list of tuple:
-         ((output_idx: int, input_idx: int, input_idx: int), node_derivative_name: str, node_derivative_type: str)
-        """
+    def output_channel_name(self, channel: Tuple):
+        assert len(channel) in {1, 2, 3}
+        if len(channel) > 1:
+            ch_names = [self.context.output_variables[channel[0]].nick_name] + \
+                       [self.context.input_variables[i].nick_name for i in channel[1:]]
+            return _node_derivative_prefix + _get_channel_name(tuple(ch_names))
+        else:
+            return self.context.output_variables[channel[0]].nick_name
 
-        # assume output types are correctly given.
-        # When given output var types, and input var types, is it possible to determine derivative types?
-        out_dim = len(self.output_variables)
-        in_dim = len(self.input_variables)
-        results = []
-
-        for i in range(out_dim):
-            if not self.output_variables[i].is_differentiable():
-                continue
-            for j in range(in_dim):
-                if not self.input_variables[j].is_differentiable():
-                    continue
-                for k in range(j, in_dim):
-                    if not self.input_variables[k].is_differentiable():
-                        continue
-                    node_derivative_name = \
-                        _node_derivative_prefix + self.second_order_derivative_name(
-                            self.output_variables[i].nick_name,
-                            self.input_variables[j].nick_name,
-                            self.input_variables[k].nick_name)
-                    node_derivative_type = self.output_variables[i].var_type
-                    results.append(((i, j, k), node_derivative_name, node_derivative_type))
-
-        return results
-
-    # TODO() re implement get_first_order_derivatives_info to avoid returning too much
-    def get_first_order_derivative_name_and_var_type(self, output_idx, input_idx):
-        return _node_derivative_prefix + self.first_order_derivative_name(
-            self.output_variables[output_idx].nick_name, self.input_variables[input_idx].nick_name), \
-               self.output_variables[output_idx].var_type
-
-    def get_result_names_and_types(self, enable_1st_order_derivative: bool = False,
-                                   enable_2nd_order_derivative: bool = False):
-        result_names = []
-        result_types = []
-        out_dim = len(self.output_variables)
-        for i in range(out_dim):
-            result_names.append(self.output_variables[i].nick_name)
-            result_types.append(self.output_variables[i].var_type)
-
-        # 1st order:
-        if enable_1st_order_derivative:
-            first_order_infos = self.get_first_order_derivatives_info()
-            for _, name, var_type in first_order_infos:
-                result_names.append(name)
-                result_types.append(var_type)
-
-        # 2nd order:
-        if enable_2nd_order_derivative:
-            second_order_infos = self.get_second_order_derivatives_info()
-            for _, name, var_type in second_order_infos:
-                result_names.append(name)
-                result_types.append(var_type)
-        return result_names, result_types
+    def output_channel_type(self, channel: Tuple):
+        assert len(channel) > 0
+        return self.context.output_variables[channel[0]].var_type
 
 
 class FunctionBase:
     """
-    A function is a certain type of process on Variables.
-    For detailed implementation of the function, it really depends on what kind of Variables
-    is it processing. From such consideration the code generation may vary.
-    It is not only the var_type of the Variables that matters, but also what they are:
-    Are they inputs, or local variables? Anyway, code generation takes that very specific
-    info.
-    A function can be an abstract notion, a symbol that matches multiple implementation,
-    if without context.
 
-    This is somehow like what a compiler is doing.
+
     """
 
     def __init__(self, input_spec: List[str], output_spec: List[str]):
@@ -369,9 +449,9 @@ class FunctionBase:
         :param input_spec: ['double','float','']
         """
 
-        assert all([(var_type in Variable.var_types or var_type == '') for var_type in input_spec]), \
+        assert all([(_is_valid_cpp_name(var_type) or var_type == '') for var_type in input_spec]), \
             "invalid input spec"
-        assert all([(var_type in Variable.var_types or var_type == '') for var_type in output_spec]), \
+        assert all([(Variable.is_numerical_var_type(var_type) or var_type == '') for var_type in output_spec]), \
             "invalid output spec"
 
         self.output_spec = output_spec.copy()
@@ -388,59 +468,87 @@ class FunctionBase:
                     assert graph is element.graph, "Function can't be called on variables from different graphs."
         assert graph is not None, "Can't infer graph from function call."
 
+        existing_input_numerical_types = []
+        for element in args:
+            if type(element) is Variable:
+                existing_input_numerical_types.append(element.var_type)
+        inferred_var_type = Variable.infer_combined_var_type(existing_input_numerical_types)
+
         # Create input variables
         input_variables: List[Variable] = []
         for element in args:
             if type(element) is Variable:
                 input_variables.append(element)
             elif type(element) in [float, int]:
-                unnamed_variable = graph.create_un_named_variable()
-                unnamed_variable.defined_as_constant(element, Variable.default_var_type)
-                input_variables.append(unnamed_variable)
+                index = len(input_variables)
+                var_type = inferred_var_type if self.input_spec[index] == '' else self.input_spec[index]
+                assert var_type is not None, "Function with no numerical input can't have unspecified input type."
 
-        # Infer output var_type
-        input_combined_var_type = Variable.infer_combined_type(
-            [input_variable.var_type for input_variable in input_variables])
+                unnamed_variable = graph.create_un_named_variable()
+                unnamed_variable.defined_as_constant(element, var_type)
+                input_variables.append(unnamed_variable)
 
         # Create output variables
         output_variables: List[Variable] = []
         for i in range(len(self.output_spec)):
-            var_type = input_combined_var_type if self.output_spec[i] == '' else self.output_spec[i]
+            var_type = inferred_var_type if self.output_spec[i] == '' else self.output_spec[i]
+            assert var_type is not None, "Function with no numerical input can't have unspecified output type."
             output_variable = graph.create_un_named_variable()
             output_variable.defined_as_expr(self, input_variables, i, var_type)
             output_variables.append(output_variable)
 
         # check the context compatibility
-        constext = FunctionContext(input_variables, output_variables)
-        res, dbg = self.is_compatible(constext)
+        context = Context(input_variables, output_variables)
+        res, dbg = self.is_compatible(context)
         assert res, dbg
 
         # Inform graph the operation.
-        graph.append_operation(self, constext)
+        graph.append_operation(self, context)
 
         if len(output_variables) > 1:
             return tuple(output_variables)
         else:
             return output_variables[0]
 
-    def is_compatible(self, context: FunctionContext) -> Tuple[bool, str]:
+    def is_compatible(self, context: Context) -> Tuple[bool, str]:
         """
         :param context:
         :return: result, debug_string
         """
-        if len(self.output_spec) != len(context.output_variables):
+        out_dim = len(context.output_variables)
+        in_dim = len(context.input_variables)
+
+        if len(self.output_spec) != out_dim:
             return False, "output variable number miss-match"
-        if len(self.input_spec) != len(context.input_variables):
+        if len(self.input_spec) != in_dim:
             return False, "input variable number miss-match"
-        # At here, we don't check the input/output type match the interface.
-        # That whether a certain variable can be transferred to this function, is decided by
-        # the derived class.
+
+        # We check the type matching
+        for i in range(out_dim):
+            spec = self.output_spec[i]
+            output_var_type = context.output_variables[i].var_type
+            if spec == '':
+                continue
+            if spec == output_var_type or Variable.is_transferable(spec, output_var_type):
+                continue
+            return False, "The %d' th output type mis-match: require %s, got %s" % (i, spec, output_var_type)
+
+        for i in range(in_dim):
+            spec = self.input_spec[i]
+            input_var_type = context.input_variables[i].var_type
+            if spec == '':
+                continue
+            if spec == input_var_type or Variable.is_transferable(input_var_type, spec):
+                continue
+            return False, "The %d' th input type mis-match: require %s, got %s" % (i, spec, input_var_type)
+
+        # check output TYPE to be EXPR
         for output_var in context.output_variables:
             if output_var.type not in [Variable.TYPE_STATE_EXPR, Variable.TYPE_CONFIG_EXPR]:
                 return False, "output variables must be expr"
         return True, ""
 
-    def print_definition(self, context: FunctionContext) -> List[str]:
+    def print_definition(self) -> List[str]:
         """
         What appears before the graph.
         For e.g. for sympy nodes with large result, we want to wrap them.
@@ -458,43 +566,35 @@ class FunctionBase:
         """
         return []
 
-    def print_call(self, context: FunctionContext, enable_1st_order_derivative: bool = False,
-                   enable_2nd_order_derivative: bool = False) -> List[str]:
+    def print_call(self, full_context: FullContext) -> Tuple[List[str], Dict[str, float]]:
         """
+
+        result_names, result_types = context.get_result_names_and_types
+
+        for example. result_names= ['ra','rb', 'NODE_Dra_Dx']
+
         Will:
-        1, assume the inputs are ready.
-        2, get outputs, together with their node derivatives.
-        :param inputs: a, b, c
-        :param outputs: sum
-        :return: List[str] as lines.
-        double sum = a + b + c
-        (When enabling derivative)
-        double D_sum_D_a = 1;
-        double D_sum_D_b = 1;
+        1, assume the inputs variables are defined and is ready.
+        2, assume the output variables are defined yet not assigned with value.
+        3, assume the non-constant output derivatives are defined yet not assigned with value.
+        The function will print lines in C++ to calculate the output variables and non-constant derivatives.
+        returned as List[str]
+        The function will tell user which derivatives are constant and should not be defined.
+        returned as Dist[str, float]
 
-        or:
-        double sum, D_sum_D_a,D_sum_D_b,...
-        (When enabling derivative)
-        sum = SumWithDerivative(a, b, &D_sum_D_a, &D_sum_D_b)
-
-        :param context:
-        :param enable_1st_order_derivative:
-        :param enable_2nd_order_derivative:
-        :return: result types, result names, and implementation lines
+        Notice that user should call this function FIRST to know what to define.
         """
         assert False, "not implemented"
 
-    def demanded_const_references(self, context: FunctionContext) -> List[Tuple[str, str]]:
-        """
-        What appears as the external dependency of the graph:
-        passed to each graph function.
 
-        can't share same name with variables.
-        :param inputs:
-        :param outputs:
-        :return: [(CostSpace, space1), (CostSpace, space2)...]
-        """
-        return []
+# the class that is ready to be
+
+# Most functions should NOT provide constant outputs.
+# this is because the interface/implementation would be dependent upon the context.
+
+# so what we need is: context independent constant outputs.
+
+# we need both context and function detail to determine whether an output der is constant.
 
 
 # A convention:
@@ -537,82 +637,107 @@ class SymPyFunction(FunctionBase):
         super(SymPyFunction, self).__init__(input_spec, output_spec)
         self.sympy_function = sympy_function
 
-    def print_call(self, context: FunctionContext, enable_1st_order_derivative: bool = False,
-                   enable_2nd_order_derivative: bool = False) -> List[str]:
+    def is_compatible(self, context: Context) -> Tuple[bool, str]:
+        res, dbg = super(SymPyFunction, self).is_compatible(context)
 
-        res, dbg = self.is_compatible(context)
+        if not res:
+            return res, dbg
+
+        if not all([Variable.is_numerical_var_type(input_var.var_type) for input_var in context.input_variables]):
+            return False, "SympyFunction input variables must be numerical."
+
+        if not all([Variable.is_numerical_var_type(output_var.var_type) for output_var in context.output_variables]):
+            return False, "SympyFunction output variables must be numerical."
+
+        return True, ""
+
+    def print_call(self, full_context: FullContext) -> Tuple[List[str], Dict[str, float]]:
+
+        res, dbg = self.is_compatible(full_context.context)
         assert res, dbg
 
+        in_dim = len(full_context.context.input_variables)
+        out_dim = len(full_context.context.output_variables)
+
+        constant_results = {}
+
+        # sympy environment
+        # zero_order_output_exprs[i] corresponds to output_variable[i]
+        # input_symbols[i] corresponds to input_variable[i]
         input_symbols = []
-        for input_variable in context.input_variables:
+        for input_variable in full_context.context.input_variables:
             if input_variable.type is Variable.TYPE_CONSTANT:
                 input_symbols.append(input_variable.value)
             else:
                 input_symbols.append(sp.symbols(input_variable.nick_name))
 
-        out_dim = len(context.output_variables)
-        in_dim = len(context.input_variables)
+        zero_order_output_exprs = self.sympy_function(*input_symbols)
+        if len(full_context.context.output_variables) == 1:
+            assert type(zero_order_output_exprs) is not tuple
+            zero_order_output_exprs = [zero_order_output_exprs, ]
+        else:
+            assert type(zero_order_output_exprs) is tuple or type(zero_order_output_exprs) is list
+        assert len(zero_order_output_exprs) == out_dim
 
-        # distinguish MIMO, derivatives
+        # Get the sympy expressions of each output.
         result_exprs = []
         result_names = []
         result_types = []
 
-        # Zero order:
-        output_exprs = self.sympy_function(*input_symbols)
-        if len(context.output_variables) == 1:
-            assert type(output_exprs) is not tuple
-            output_exprs = [output_exprs, ]
-        else:
-            assert type(output_exprs) is tuple or type(output_exprs) is list
-        assert len(output_exprs) == out_dim
+        output_channels = full_context.get_output_channels()
 
-        result_exprs += list(output_exprs)
-        for i in range(out_dim):
-            result_names.append(context.output_variables[i].nick_name)
-            result_types.append(context.output_variables[i].var_type)
+        for channel in output_channels:
+            is_constant_derivative_output = False
+            if len(channel) == 1:
+                expr = zero_order_output_exprs[channel[0]]
+            elif len(channel) == 2:
+                expr = zero_order_output_exprs[channel[0]].diff(input_symbols[channel[1]])
+                is_constant_derivative_output = expr.is_Number
+            elif len(channel) == 3:
+                expr = (zero_order_output_exprs[channel[0]].diff(input_symbols[channel[1]])).diff(
+                    input_symbols[channel[2]])
+                is_constant_derivative_output = expr.is_Number
+            else:
+                assert False
 
-        # 1st order:
-        if enable_1st_order_derivative:
-            first_order_infos = context.get_first_order_derivatives_info()
-            for out_idx_in_idx, name, var_type in first_order_infos:
-                out_idx, in_idx = out_idx_in_idx
-                result_names.append(name)
-                result_exprs.append(output_exprs[out_idx].diff(input_symbols[in_idx]))
-                result_types.append(var_type)
+            res_name = full_context.output_channel_name(channel)
+            res_type = full_context.output_channel_type(channel)
 
-        # 2nd order:
-        if enable_2nd_order_derivative:
-            second_order_infos = context.get_second_order_derivatives_info()
-            for out_idx_in_idx1_in_idx2, name, var_type in second_order_infos:
-                out_idx, in_idx1, in_idx2 = out_idx_in_idx1_in_idx2
-                result_names.append(name)
-                result_exprs.append((output_exprs[out_idx].diff(input_symbols[in_idx1])).diff(input_symbols[in_idx2]))
-                result_types.append(var_type)
+            # Arbitrate here/
+            if is_constant_derivative_output:
+                constant_results[res_name] = float(expr)
+            else:
+                result_exprs.append(expr)
+                result_names.append(res_name)
+                result_types.append(res_type)
 
+        # Calculate the simplified expression.
         replacements, reduced_exprs = sp.cse(result_exprs, sp.utilities.iterables.numbered_symbols(_sympy_var_prefix))
-
         assert type(reduced_exprs) is tuple or type(reduced_exprs) is list
         assert len(result_exprs) == len(reduced_exprs)
 
         printer = OptimizedCXX11Printer()
 
         sympy_local_var_type = \
-            Variable.infer_combined_type([input_variable.var_type for input_variable in context.input_variables])
+            Variable.infer_combined_var_type(
+                [input_variable.var_type for input_variable in full_context.context.input_variables])
+
+        assert sympy_local_var_type is not None
 
         lines = []
         # calculation steps
         lines.append("{")
         for replacement in replacements:
-            line = printer.doprint(replacement[1], sympy_local_var_type + ' ' + str(replacement[0])).replace('\n', '')
-            lines.append(_indent + line)
+            this_line = printer.doprint(replacement[1], sympy_local_var_type + ' ' + str(replacement[0])).replace('\n',
+                                                                                                                  '')
+            lines.append(_indent + this_line)
         # assign outputs
         for i in range(len(reduced_exprs)):
-            line = printer.doprint(reduced_exprs[i], result_names[i])
-            lines.append(_indent + line)
+            this_line = printer.doprint(reduced_exprs[i], result_names[i])
+            lines.append(_indent + this_line)
         lines.append("}")
 
-        return lines
+        return lines, constant_results
 
 
 class _SymPyOperatorFunctions:
@@ -623,30 +748,19 @@ class _SymPyOperatorFunctions:
     sympy_div = SymPyFunction(lambda a, b: a / b)
 
 
-class CppNamespaceFunction(FunctionBase):
-    def __init__(self, function_name, input_spec: List[str], output_spec: List[str]):
-        # input , output types must be specified
-        assert all([var_type in Variable.var_types for var_type in input_spec]), "invalid input spec"
-        assert all([var_type in Variable.var_types for var_type in output_spec]), "invalid output spec"
-
-        super(CppNamespaceFunction, self).__init__(input_spec, output_spec)
-        assert _is_valid_namespace(function_name), "invalid function_name :(%s)" % function_name
-        self.function_name = function_name
-
-
+"""
 class CppMemberFunction(FunctionBase):
     def __init__(self, object_type: str, object_name: str, function_name: str, input_spec: List[str],
                  output_spec: List[str]):
-        """
+
         const CostSpace& space1;
         space1.collision_cost(...)
         :param object_type: CostSpace
         :param object_name: space1
         :param function_name: collision_cost
-        """
         # input , output types must be specified
-        assert all([var_type in Variable.var_types for var_type in input_spec]), "invalid input spec"
-        assert all([var_type in Variable.var_types for var_type in output_spec]), "invalid output spec"
+        assert all([var_type in Variable.numerical_var_types for var_type in input_spec]), "invalid input spec"
+        assert all([var_type in Variable.numerical_var_types for var_type in output_spec]), "invalid output spec"
 
         super(CppMemberFunction, self).__init__(input_spec, output_spec)
 
@@ -657,14 +771,20 @@ class CppMemberFunction(FunctionBase):
         self.object_type = object_type
         self.object_name = object_name
         self.function_name = function_name
+"""
 
 
-class GraphFunction(FunctionBase):
-    # So people can be owner of a sub graph, managed by a big graph.
-    # TODO(): implement with :
-    #  1, checking no - loop dependency
-    #  2, assert each outer graph statefuls are not passed as config to this graph.
-    pass
+# CppNamespaceFunction: header to include.
+# What to have in the cpp file?
+# the definition of each channel. I mean, at least you need constant outputs. implementation(assumed)
+# there is a comment decoration protocol.
+# 1, function name.
+# 2, function constant outputs.
+# 3, const references, just all what a Graph Function should have.
+# 4, input spec.
+# 5, output spec.
+
+# interface function !! base class.
 
 
 class ConditionalFunction(FunctionBase):
@@ -678,6 +798,289 @@ class ConditionalFunction(FunctionBase):
     pass
 
 
+class GraphFieldManager:
+    def __init__(self):
+        self.existing_fields: Set[str] = set()
+        self.constant_fields: Dict[str] = {}
+        pass
+
+    def claim_field_as_normal(self, name: str):
+        self.existing_fields.add(name)
+
+    def claim_field_as_constant(self, name: str, value: float):
+        assert name not in self.constant_fields, "\'%s\' already claimed!" % name
+        self.constant_fields[name] = value
+
+    def is_constant(self, name: str):
+        if name in self.existing_fields:
+            return False
+        else:
+            return True
+
+    def is_zero(self, name: str):
+        if name in self.existing_fields:
+            return False
+        elif name in self.constant_fields:
+            return self.constant_fields[name] == 0
+        else:
+            return True
+
+    def get_constant_value(self, name: str):
+        if name in self.constant_fields:
+            return self.constant_fields[name]
+        else:
+            return 0
+
+    def add_product_of_fields_to_target_field(self,
+                                              output_lines: List[str],  # output
+                                              target_field: str,
+                                              target_field_type: str,
+                                              fields_to_prod: List[str],
+                                              gain: float = 1,
+                                              indent_num: int = 0):
+        if not fields_to_prod:
+            return
+        # at least adding something.
+
+        constant_factor = gain
+        for name in fields_to_prod:
+            if self.is_constant(name):
+                constant_factor *= self.get_constant_value(name)
+
+        items = ''
+        for name in fields_to_prod:
+            if not self.is_constant(name):
+                items += name + '*'
+        if items != '':
+            items = items[:-1]
+
+        # items and constant factor append to field
+        if constant_factor == 0:
+            return
+
+        all_indents = _indent * indent_num
+
+        if items == '':
+            # adding constant number
+            if target_field in self.constant_fields:
+                # add only to storage
+                self.constant_fields[target_field] += constant_factor
+                # output_lines.append('all_indents + // %s += %f;'%(target_field, constant_factor))
+            elif target_field in self.existing_fields:
+                # add to variable
+                output_lines.append(all_indents + '%s += %f;' % (target_field, constant_factor))
+            else:
+                # create variable
+                self.constant_fields[target_field] = constant_factor
+                # output_lines.append('all_indents + // %s = %f;'%(target_field, constant_factor))
+        else:
+            # adding expression
+            expr = "(%f) * %s" % (constant_factor, items) if constant_factor != 1 else items
+            if target_field in self.constant_fields:
+                # no longer constant, become existing normal
+                value = self.constant_fields[target_field]
+                full_expr = '%f + %s' % (value, items) if value != 0 else items
+                output_lines.append(all_indents + '%s %s=%s;' % (target_field_type, target_field, full_expr))
+
+                del self.constant_fields[target_field]
+                self.existing_fields.add(target_field)
+            elif target_field in self.existing_fields:
+                # add expr to existing field.
+                output_lines.append(all_indents + '%s += %s;' % (target_field, expr))
+            else:
+                # create existing field with expr
+                output_lines.append(all_indents + '%s %s=%s;' % (target_field_type, target_field, expr))
+                self.existing_fields.add(target_field)
+
+
+class InterfaceFunction(FunctionBase):
+    def __init__(self, input_spec: List[str],
+                 output_spec: List[str],
+                 function_name: str,
+                 constant_derivative_outputs: Dict[Tuple, float]):
+        # 1, a specification of which dout_din is always constant and should be implementation wise recorded.
+        # when print call, 2 types of contantification:
+        # 1, context irrelevant constant
+        # 2, context relevant constant (like putting constant to stateful channel, and thusu some interfaces not used.)
+
+        # Make sure the field constant_outputs only consider 1, and make sure print_call lines are considering 2.
+        super(InterfaceFunction, self).__init__(input_spec, output_spec)
+
+        self.constant_derivative_outputs = constant_derivative_outputs
+        self.function_name = function_name
+
+    # It is a trick
+    def calling_prefix(self):
+        return ''
+
+    def print_call(self, full_context: FullContext) -> Tuple[List[str], Dict[str, float]]:
+        in_dim = len(full_context.context.input_variables)
+        out_dim = len(full_context.context.output_variables)
+
+        # determine the interface
+        full_channels = _full_output_channels_with_derivatives(in_dim, out_dim,
+                                                               full_context.option.enable_1st_order_derivative,
+                                                               full_context.option.enable_2nd_order_derivative)
+        interface_output_channels = []
+        for channel in full_channels:
+            if channel not in self.constant_derivative_outputs:
+                interface_output_channels.append(channel)
+
+        channels_required = set(full_context.get_output_channels())
+        interface_output_names = []
+        # type to name
+        unused_variables: Dict[str, str] = {}
+        for channel in interface_output_channels:
+            if channel in channels_required:
+                interface_output_names.append(full_context.output_channel_name(channel))
+            else:
+                var_type = full_context.output_channel_type(channel)
+                if var_type not in unused_variables:
+                    unused_variables[var_type] = _graph_unused_prefix + var_type
+                interface_output_names.append(unused_variables[var_type])
+
+        lines = []
+        lines.append("{")
+        for var_type, var_name in unused_variables.items():
+            lines.append(_indent + var_type + " " + var_name + ";")
+
+        calling = self.calling_prefix()
+        calling += full_context.option.decorate(self.function_name)
+
+        calling += "("
+
+        for i in range(in_dim):
+            calling += full_context.context.input_variables[i].nick_name + ","
+
+        for out_name in interface_output_names:
+            calling += "&" + out_name + ","
+
+        if calling[-1] == ",":
+            calling = calling[:-1]
+        calling += ");"
+
+        lines.append(calling)
+
+        lines.append("}")
+
+        # constant_derivative_outputs.
+        constant_derivative_outputs = {}
+        for channel, value in self.constant_derivative_outputs.items():
+            constant_derivative_outputs[full_context.output_channel_name(channel)] = value
+
+        return lines, constant_derivative_outputs
+
+    def comment_header(self):
+        return '=====InterfaceSpec[%s]=====' % self.function_name
+
+    @staticmethod
+    def channel2str(channel):
+        assert len(channel) in {1, 2, 3}
+        return "_".join([str(ch) for ch in channel])
+
+    @staticmethod
+    def str2channel(string: str)->Tuple:
+        return tuple([int(ch_str) for ch_str in str.split("_")])
+
+    def to_comments(self) -> List[str]:
+        comment = []
+        comment.append("input_spec:" + ','.join(self.input_spec))
+        comment.append("output_spec:" + ','.join(self.output_spec))
+
+        const_channels = []
+        const_values = []
+        for channel, value in self.constant_derivative_outputs.items():
+            const_channels.append(str(channel))
+            const_values.append(str(value))
+
+        comment.append("const_channels:" + ','.join(const_channels))
+        comment.append("const_values:" + ','.join(const_values))
+        return comment
+
+    def load_interface_from_comment(self, comments: List[str]):
+        """
+        :param comments: contents between 2 comment_header, shouldn't have '\n' or '\r'
+        :return: change class member in place
+        """
+        debug_prefix = "load_interface_from_comment:"
+        # Store each list by field name
+        fields = {}
+        for comment_line in comments:
+            colon = comment_line.find(":")
+            if colon < -1:
+                continue
+            field_name = comment_line[:colon].replace(' ', '')
+            field_elements = comment_line[colon + 1:].replace(' ', '')
+
+            if field_name in fields:
+                assert False, debug_prefix + "repeated field in comments: %s" % field_name
+            fields[field_name] = field_elements
+
+        # input_spec
+        assert "input_spec" in fields, debug_prefix + "comments must have input_spec"
+        self.input_spec = fields["input_spec"].split(',')
+        assert all([_is_valid_cpp_name(var_type) for var_type in self.input_spec]), debug_prefix + "invalid input spec"
+
+        # output_spec
+        assert "output_spec" in fields, debug_prefix + "comments must have output_spec"
+        self.output_spec = fields["output_spec"].split(',')
+        assert all([Variable.is_numerical_var_type(var_type) for var_type in self.output_spec]), \
+            debug_prefix + "invalid output spec"
+
+        # constant_derivative_outputs
+        assert "const_channels" in fields, debug_prefix + "comments must have const_channels"
+        assert "const_values" in fields, debug_prefix + "comments must have const_values"
+        try:
+            const_channels = [self.str2channel(word) for word in fields["const_channels"].split(',')]
+            const_values = [float(word) for word in fields["const_values"].split(',')]
+        except:
+            assert False, debug_prefix + "failed to parse const_channels or const_values"
+
+        assert len(const_channels) == \
+               len(const_values), debug_prefix + "const_values and const_channels must have same length"
+
+        self.constant_derivative_outputs = {}
+        for i in range(len(const_values)):
+            self.constant_derivative_outputs[const_channels[i]] = const_values[i]
+
+
+class GraphFunction(InterfaceFunction):
+    #  TODO(): implement with :
+    #  1, checking no - loop dependency
+    #  2, assert each outer graph statefuls are not passed as config to this graph.
+    def __init__(self,
+                 input_spec: List[str],
+                 output_spec: List[str],
+                 function_name: str,
+                 constant_derivative_outputs: Dict[Tuple, float],
+                 implementations: List[List[str]]):
+        super(GraphFunction, self).__init__(input_spec, output_spec,
+                                            function_name, constant_derivative_outputs)
+
+        # implementation of each option in _all_options.
+        assert len(implementations) == len(_all_options)
+        self.implementations = implementations
+
+    def print_definition(self) -> List[str]:
+        result = []
+
+        for implementation in self.implementations:
+            result += implementation
+            result += ['']
+        return result
+
+    def dump_to_cpp_file(self, filename:  str, namespaces: List[str]):
+        pass
+
+
+class CppFunction(FunctionBase):
+    # TODO(huaiyuan): Graph function load-able.
+    # if some graph uses me, its generated cpp must also depends on my header.
+    # here the dirty work begins.
+    def __init__(self, header_filename: str, function_name: str, class_name: str):
+        pass
+
+
 class Graph:
     def __init__(self, name: str = "UntitledFunc"):
         # contain all variables
@@ -687,10 +1090,10 @@ class Graph:
 
         self._un_named_count = 0
 
-        self._operations: List[Tuple[FunctionBase, FunctionContext]] = []
+        self._operations: List[Tuple[FunctionBase, Context]] = []
 
     def state_inputs(self, names: List[str], var_type: str):
-        assert var_type in Variable.var_types, "Invalid type: %s" % var_type
+        assert Variable.is_numerical_var_type(var_type), "Invalid type: %s" % var_type
         if not names:
             return None
 
@@ -704,7 +1107,7 @@ class Graph:
             return results
 
     def config_inputs(self, names: List[str], var_type: str):
-        assert var_type in Variable.var_types, "Invalid type: %s" % var_type
+        assert _is_valid_cpp_name(var_type), "Invalid type: %s" % var_type
         if not names:
             return None
 
@@ -717,13 +1120,12 @@ class Graph:
         else:
             return results
 
-    def append_operation(self, function: FunctionBase, context: FunctionContext):
+    def append_operation(self, function: FunctionBase, context: Context):
         assert function.is_compatible(context)
         # TODO(): check function references are good with variable names.
         self._operations.append((function, context))
 
     #
-
     def get_state_input_variables(self):
         res = []
         for variable in self._all_variables.values():
@@ -747,283 +1149,86 @@ class Graph:
             return False
         return True
 
-    @staticmethod
-    def get_first_order_graph_derivatives_info(input_variables: List[Variable], output_variables: List[Variable]):
+    # TODO(huaiyuan): may be this is a member function of GraphFunction. Just Maybe
+    # TODO(huaiyuan): comment on implementation: how many addition, how many multiplication
+    def print_derivative_definition(self,
+                                    input_variables: List[Variable],
+                                    output_variables: List[Variable],
+                                    option: Option) -> Tuple[List[str], Dict[Tuple, float]]:
         """
-        :return: a list of tuple:
-         ((output_idx: int, input_idx: int), graph_derivative_name: str, graph_derivative_type: str)
+        :param input_variables: you will use this for ordering, although the graph know what it takes
+        :param output_variables: a list of output variables, must be member of the graph
+        :param option: specifying the generation option
+        :return: (implementation with function head, Dict of constant derivative outputs)
         """
-        out_dim = len(output_variables)
-        in_dim = len(input_variables)
-        results = []
+        assert option in _all_options, "option Must be one of _all_options"
 
-        for i in range(out_dim):
-            if not output_variables[i].is_differentiable():
-                continue
-            for j in range(in_dim):
-                if not input_variables[j].is_differentiable():
-                    continue
-                graph_derivative_name = \
-                    _graph_derivative_prefix + "D_%s_D_%s" % (
-                        output_variables[i].nick_name, input_variables[j].nick_name)
-                graph_derivative_type = output_variables[i].var_type
-
-                results.append(((i, j), graph_derivative_name, graph_derivative_type))
-
-        return results
-
-    @staticmethod
-    def get_second_order_graph_derivatives_info(input_variables: List[Variable], output_variables: List[Variable]):
-        """
-        :return: a list of tuple:
-         ((output_idx: int, input_idx: int, input_idx: int), graph_derivative_name: str, graph_derivative_type: str)
-        """
-
-        out_dim = len(output_variables)
-        in_dim = len(input_variables)
-        results = []
-
-        for i in range(out_dim):
-            if not output_variables[i].is_differentiable():
-                continue
-            for j in range(in_dim):
-                if not input_variables[j].is_differentiable():
-                    continue
-                for k in range(j, in_dim):
-                    if not input_variables[k].is_differentiable():
-                        continue
-                    graph_derivative_name = \
-                        _graph_derivative_prefix + "D2_%s_D_%s_D_%s" % (
-                            output_variables[i].nick_name,
-                            input_variables[j].nick_name,
-                            input_variables[k].nick_name)
-                    graph_derivative_type = output_variables[i].var_type
-                    results.append(((i, j, k), graph_derivative_name, graph_derivative_type))
-
-        return results
-
-    def print_zero_order_definition(self, output_variables: List[Variable]):
-        """
-        deprecated
-        :param output_variables:
-        :return:
-        """
-        for variable in output_variables:
-            assert variable.graph is self
-            assert variable in self._all_variables.values()
-
-        lines = []
-
-        state_inputs = []
-        config_inputs = []
-        outputs = []
-        for variable in self._all_variables.values():
-            if variable.type is Variable.TYPE_CONFIG_INPUT:
-                config_inputs.append((variable.var_type, variable.nick_name))
-            elif variable.type is Variable.TYPE_STATE_INPUT:
-                state_inputs.append((variable.var_type, variable.nick_name))
-
-            if variable in output_variables:
-                outputs.append((variable.var_type, variable.nick_name))
-
-        function_head = 'void ' + _decorate_function_name_with_derivatives(self.name, False, False) + "("
-        for var_type, name in config_inputs:
-            function_head += Variable.const_reference(var_type) + ' ' + name + ','
-        for var_type, name in state_inputs:
-            function_head += Variable.const_reference(var_type) + ' ' + name + ','
-        for var_type, name in outputs:
-            function_head += var_type + '* ' + _graph_output_prefix + name + ','
-        function_head = function_head[:-1]
-        function_head += ") {"
-
-        lines.append(function_head)
-
-        for function, context in self._operations:
-            result_types, result_names, calculation = function.print_call(context, False, False)
-            # TODO(): clear unused variables making use of AC automaton.
-            # Or: wrap sympy function
-
-            for i in range(len(result_types)):
-                lines.append(_indent + result_types[i] + ' ' + result_names[i] + ';')
-            lines += [_indent + ln for ln in calculation]
-
-        for var_type, name in outputs:
-            lines.append(_indent + '*' + _graph_output_prefix + name + '=' + name + ';')
-        lines.append("}")
-        return lines
-
-    def print_derivative_definition(self, output_variables: List[Variable],
-                                    enable_1st_order_derivative: bool = False,
-                                    enable_2nd_order_derivative: bool = False):
+        # 1, you cannot determine interface until you
+        # once determined input variables and output variables, we can get the derivative order of them, their
         # BP core:
         # 1, set of declared vars. check existence when using. special simplification when absence
         # 2, when creating new declared vars, check existence for addition.
+
         for variable in output_variables:
             assert self.is_member(variable), "output variables must be member of the graph."
 
-        state_inputs = self.get_state_input_variables()
-        config_inputs = self.get_config_input_variables()
-        # output_variables
-        input_variables = state_inputs + config_inputs
+        for variable in input_variables:
+            assert self.is_member(variable), "input variables must be member of the graph."
 
-        first_order_info = []
-        second_order_info = []
-        if enable_1st_order_derivative:
-            first_order_info = self.get_first_order_graph_derivatives_info(input_variables, output_variables)
+        names_of_inputs = set()
+        for variable in self._all_variables.values():
+            if variable.type in {Variable.TYPE_STATE_INPUT, Variable.TYPE_CONFIG_INPUT}:
+                names_of_inputs.add(variable.nick_name)
 
-        if enable_2nd_order_derivative:
-            second_order_info = self.get_second_order_graph_derivatives_info(input_variables, output_variables)
+        assert len(input_variables) == len(names_of_inputs), \
+            "please make sure input_variables exactly contains: " + str(names_of_inputs)
+        assert names_of_inputs == {variable.nick_name for variable in input_variables}, \
+            "please make sure input_variables exactly contains: " + str(names_of_inputs)
 
-        # Determine function head
-        function_head = 'void ' + _decorate_function_name_with_derivatives(self.name, enable_1st_order_derivative,
-                                                                           enable_2nd_order_derivative) + "("
-        for var in state_inputs:
-            function_head += Variable.const_reference(var.var_type) + ' ' + var.nick_name + ' /*state*/,'
-        for var in config_inputs:
-            function_head += Variable.const_reference(var.var_type) + ' ' + var.nick_name + ' /*config*/,'
-        for var in output_variables:
-            function_head += var.var_type + '* ' + _graph_output_prefix + var.nick_name + ','
-
-        if enable_1st_order_derivative:
-            for _, name, var_type in first_order_info:
-                function_head += var_type + '* ' + _graph_output_prefix + name + ','
-
-        if enable_2nd_order_derivative:
-            for _, name, var_type in second_order_info:
-                function_head += var_type + '* ' + _graph_output_prefix + name + ','
-
-        if function_head[-1] == ',':
-            function_head = function_head[:-1]
-
-        function_head += ") {"
+        # when asked 2nd order derivative, 1st order must be also ready.
+        sub_function_option = Option(
+            enable_1st_order_derivative=option.enable_2nd_order_derivative or option.enable_1st_order_derivative,
+            enable_2nd_order_derivative=option.enable_2nd_order_derivative)
+        assert sub_function_option in _all_options, "sub option Must be one of _all_options"
 
         lines = []
-        lines.append(function_head)
-
-        # when not in this set, the field is deemed to be 0
-        # an exception is, for da_da, that value is 1.
-        existing_fields = set()
+        manager = GraphFieldManager()
 
         for function, context in self._operations:
-            calculation = \
-                function.print_call(context,
-                                    enable_2nd_order_derivative or enable_1st_order_derivative,
-                                    enable_2nd_order_derivative)
-            # TODO(): clear unused variables making use of AC automaton.
-            result_names, result_types = context.get_result_names_and_types(
-                enable_2nd_order_derivative or enable_1st_order_derivative,
-                enable_2nd_order_derivative)
+            full_context = FullContext(context,
+                                       sub_function_option)
 
-            for i in range(len(result_types)):
-                lines.append(_indent + result_types[i] + ' ' + result_names[i] + ';')
+            calculation, constant_outputs = \
+                function.print_call(full_context)
+            # TODO(): clear unused variables making use of AC automaton.
+
+            channels = full_context.get_output_channels()
+            for channel in channels:
+                result_name = full_context.output_channel_name(channel)
+                result_type = full_context.output_channel_type(channel)
+                if result_name not in constant_outputs:
+                    lines.append(_indent + result_type + ' ' + result_name + ';')
+                    manager.claim_field_as_normal(result_name)
+                else:
+                    manager.claim_field_as_constant(result_name, constant_outputs[result_name])
+
             lines += [_indent + ln for ln in calculation]
 
-            # Assume the context provides follows:
-            if enable_2nd_order_derivative or enable_1st_order_derivative:
-                for _, node_der_name, _ in context.get_first_order_derivatives_info():
-                    existing_fields.add(node_der_name)
-            if enable_2nd_order_derivative:
-                for _, node_der_name, _ in context.get_second_order_derivatives_info():
-                    existing_fields.add(node_der_name)
+        def get_graph_derivative_name(out_name: str, in_names: List[str]):
+            in_names_copy = in_names.copy()
+            in_names_copy.sort()
 
-        for var in output_variables:
-            lines.append(_indent + '*' + _graph_output_prefix + var.nick_name + '=' + var.nick_name + ';')
+            order = len(in_names_copy)
+            assert order in [1, 2]
 
-        def add_to_field(field_name: str, field_var_type: str, expression_str):
-            if expression_str == '':
-                return
-
-            if field_name in existing_fields:
-                lines.append(_indent + field_name + '+=' + expression_str + ';')
+            if order is 1:
+                return _graph_derivative_prefix + _get_channel_name((out_name, in_names_copy[0]))
+            elif order is 2:
+                return _graph_derivative_prefix + _get_channel_name((out_name, *in_names_copy))
             else:
-                lines.append(_indent + field_var_type + ' ' + field_name + '=' + expression_str + ';')
-                existing_fields.add(field_name)
+                assert False
 
-        class Expression:
-            def expression(self) -> str:
-                pass
-
-            def is_constant_one(self):
-                pass
-
-            def is_constant_zero(self):
-                pass
-
-        class ExistingExpression(Expression):
-            # TODO(): also simplify for special node_derivatives outputs such as 1.0, 0.0;
-            def __init__(self, expr: str):
-                self.expr = expr
-
-            def is_constant_one(self):
-                return False
-
-            def is_constant_zero(self):
-                return self.expr not in existing_fields
-
-            def expression(self):
-                return self.expr
-
-        class GraphDerivative(Expression):
-            def __init__(self, out_name: str, in_names: List[str]):
-                self.out_name = out_name
-                self.in_names = in_names
-                self.in_names.sort()
-                self.order = len(self.in_names)
-                assert self.order in [1, 2]
-
-                if self.order is 1:
-                    self.expr: str = _graph_derivative_prefix + FunctionContext.first_order_derivative_name(
-                        self.out_name, self.in_names[0])
-                elif self.order is 2:
-                    self.expr: str = _graph_derivative_prefix + FunctionContext.second_order_derivative_name(
-                        self.out_name, *self.in_names)
-
-            def expression(self):
-                return self.expr
-
-            def is_constant_one(self):
-                if self.expr not in existing_fields:
-                    if self.order is 1:
-                        return self.in_names[0] == self.out_name
-                return False
-
-            def is_constant_zero(self):
-                if self.expr not in existing_fields and not self.is_constant_one():
-                    return True
-                return False
-
-        class NumericExpression(Expression):
-            def __init__(self, val: float):
-                self.val = val
-
-            def is_constant_one(self):
-                return self.val == 1.0
-
-            def is_constant_zero(self):
-                return self.val == 0.0
-
-            def expression(self) -> str:
-                return str(self.val)
-
-        def get_product_expression(items: List[Expression]):
-            if not items:
-                return ''
-
-            if any([item.is_constant_zero() for item in items]):
-                return ''
-
-            if all([item.is_constant_one() for item in items]):
-                return '1'
-
-            # no zero, have non one item
-            result = ''
-            for item in items:
-                if not item.is_constant_one():
-                    result += '*' + item.expression()
-            result = result[1:]
-            return result
-
-        if enable_1st_order_derivative or enable_2nd_order_derivative:
+        if option.enable_1st_order_derivative or option.enable_2nd_order_derivative:
             # Compute first order derivatives
             for active_variable in output_variables:
                 if not active_variable.is_differentiable():
@@ -1036,25 +1241,32 @@ class Graph:
                 while step >= 0 and active_variable not in self._operations[step][1].output_variables:
                     step -= 1
 
+                # starts from the fact da_da = 1.
+                manager.claim_field_as_constant(
+                    get_graph_derivative_name(active_variable.nick_name, [active_variable.nick_name, ]), 1)
+
                 # bp the entire graph
                 for i in range(step, -1, -1):
                     _, context = self._operations[i]
+                    full_context = FullContext(context,
+                                               sub_function_option)
 
                     # Update graph derivative from Node derivatives
-                    for out_idx_in_idx, node_der_name, _ in context.get_first_order_derivatives_info():
-                        out_idx, in_idx = out_idx_in_idx
+                    for out_idx, in_idx in full_context.first_order_channels:
+                        node_der_name = full_context.output_channel_name((out_idx, in_idx))
                         in_name = context.input_variables[in_idx].nick_name
                         out_name = context.output_variables[out_idx].nick_name
 
                         # Simple chain rule
-                        d_active_d_node_in = GraphDerivative(active_variable.nick_name, [in_name, ])
-                        d_active_d_node_out = GraphDerivative(active_variable.nick_name, [out_name, ])
-                        node_d_out_d_in = ExistingExpression(node_der_name)
+                        d_active_d_node_in = get_graph_derivative_name(active_variable.nick_name, [in_name, ])
+                        d_active_d_node_out = get_graph_derivative_name(active_variable.nick_name, [out_name, ])
 
-                        add_to_field(d_active_d_node_in.expression(), active_var_type,
-                                     get_product_expression([d_active_d_node_out, node_d_out_d_in]))
+                        manager.add_product_of_fields_to_target_field(lines,
+                                                                      d_active_d_node_in, active_var_type,
+                                                                      [d_active_d_node_out, node_der_name],
+                                                                      indent_num=1)
 
-        if enable_2nd_order_derivative:
+        if option.enable_2nd_order_derivative:
             # A table of co-relation.
             # ensures a not in table[a]
             def co_relate(name_1, name_2, table: Dict[str, Set[str]]):
@@ -1086,91 +1298,166 @@ class Graph:
                 # bp the entire graph
                 for i in range(step, -1, -1):
                     _, context = self._operations[i]
+                    full_context = FullContext(context,
+                                               sub_function_option)
 
                     # Update graph derivative from Node derivatives
-                    for out_idx_in_idx_1_in_idx_2, node_der_name, _ in context.get_second_order_derivatives_info():
-                        out_idx, in_idx_1, in_idx_2 = out_idx_in_idx_1_in_idx_2
-                        in_1_name = context.input_variables[in_idx_1].nick_name
-                        in_2_name = context.input_variables[in_idx_2].nick_name
-                        out_name = context.output_variables[out_idx].nick_name
+                    for out_idx, in_idx_1, in_idx_2 in full_context.second_order_channels:
+                        in_1_name = full_context.context.input_variables[in_idx_1].nick_name
+                        in_2_name = full_context.context.input_variables[in_idx_2].nick_name
+                        out_name = full_context.context.output_variables[out_idx].nick_name
 
                         d2_active_d_node_in_1_d_node_in_2 = \
-                            GraphDerivative(active_variable.nick_name, [in_1_name, in_2_name])
-                        d_active_d_node_out = GraphDerivative(active_variable.nick_name, [out_name, ])
+                            get_graph_derivative_name(active_variable.nick_name, [in_1_name, in_2_name])
+                        d_active_d_node_out = get_graph_derivative_name(active_variable.nick_name, [out_name, ])
                         d2_active_d_node_out_d_node_out = \
-                            GraphDerivative(active_variable.nick_name, [out_name, out_name])
+                            get_graph_derivative_name(active_variable.nick_name, [out_name, out_name])
 
-                        node_d2_out_d_in_1_d_in_2 = ExistingExpression(node_der_name)
-                        node_d_out_d_in_1 = ExistingExpression(
-                            context.get_first_order_derivative_name_and_var_type(out_idx, in_idx_1)[0])
-                        node_d_out_d_in_2 = ExistingExpression(
-                            context.get_first_order_derivative_name_and_var_type(out_idx, in_idx_2)[0])
+                        node_d2_out_d_in_1_d_in_2 = full_context.output_channel_name((out_idx, in_idx_1, in_idx_2))
+                        node_d_out_d_in_1 = full_context.output_channel_name((out_idx, in_idx_1))
+                        node_d_out_d_in_2 = full_context.output_channel_name((out_idx, in_idx_2))
 
-                        add_to_field(d2_active_d_node_in_1_d_node_in_2.expression(), active_var_type,
-                                     get_product_expression([d_active_d_node_out, node_d2_out_d_in_1_d_in_2]))
-                        add_to_field(d2_active_d_node_in_1_d_node_in_2.expression(), active_var_type,
-                                     get_product_expression(
-                                         [d2_active_d_node_out_d_node_out, node_d_out_d_in_1, node_d_out_d_in_2]))
+                        manager.add_product_of_fields_to_target_field(lines,
+                                                                      d2_active_d_node_in_1_d_node_in_2,
+                                                                      active_var_type,
+                                                                      [d_active_d_node_out, node_d2_out_d_in_1_d_in_2],
+                                                                      indent_num=1)
+
+                        manager.add_product_of_fields_to_target_field(lines,
+                                                                      d2_active_d_node_in_1_d_node_in_2,
+                                                                      active_var_type,
+                                                                      [d2_active_d_node_out_d_node_out,
+                                                                       node_d_out_d_in_1, node_d_out_d_in_2],
+                                                                      indent_num=1)
+
                         if in_idx_1 != in_idx_2 and \
-                                d2_active_d_node_in_1_d_node_in_2.expression() in existing_fields:
+                                not manager.is_zero(d2_active_d_node_in_1_d_node_in_2):
                             co_relate(in_1_name, in_2_name, existing_cross_items_of_variable)
 
-                    for out_idx_in_idx, node_der_name, _ in context.get_first_order_derivatives_info():
-                        out_idx, in_idx = out_idx_in_idx
-                        in_name = context.input_variables[in_idx].nick_name
-                        out_name = context.output_variables[out_idx].nick_name
+                    for out_idx, in_idx in full_context.first_order_channels:
+                        in_name = full_context.context.input_variables[in_idx].nick_name
+                        out_name = full_context.context.output_variables[out_idx].nick_name
 
                         # output channel has no co-related items
                         if out_name not in existing_cross_items_of_variable:
                             continue
 
-                        node_d_out_d_in = ExistingExpression(node_der_name)
+                        node_d_out_d_in = full_context.output_channel_name((out_idx, in_idx))
                         for co_related in existing_cross_items_of_variable[out_name]:
                             d2_active_d_node_out_d_co_related = \
-                                GraphDerivative(active_variable.nick_name, [out_name, co_related])
+                                get_graph_derivative_name(active_variable.nick_name, [out_name, co_related])
                             d2_active_d_node_in_d_co_related = \
-                                GraphDerivative(active_variable.nick_name, [in_name, co_related])
+                                get_graph_derivative_name(active_variable.nick_name, [in_name, co_related])
                             if co_related != in_name:
-                                add_to_field(d2_active_d_node_in_d_co_related.expression(), active_var_type,
-                                             get_product_expression(
-                                                 [d2_active_d_node_out_d_co_related, node_d_out_d_in]))
+                                manager.add_product_of_fields_to_target_field(lines,
+                                                                              d2_active_d_node_in_d_co_related,
+                                                                              active_var_type,
+                                                                              [d2_active_d_node_out_d_co_related,
+                                                                               node_d_out_d_in],
+                                                                              indent_num=1)
                             else:
-                                add_to_field(d2_active_d_node_in_d_co_related.expression(), active_var_type,
-                                             get_product_expression(
-                                                 [NumericExpression(2), d2_active_d_node_out_d_co_related,
-                                                  node_d_out_d_in]))
+                                manager.add_product_of_fields_to_target_field(lines,
+                                                                              d2_active_d_node_in_d_co_related,
+                                                                              active_var_type,
+                                                                              [d2_active_d_node_out_d_co_related,
+                                                                               node_d_out_d_in],
+                                                                              indent_num=1,
+                                                                              gain=2)
 
                             if co_related != in_name and \
-                                    d2_active_d_node_in_d_co_related.expression() in existing_fields:
+                                    not manager.is_zero(d2_active_d_node_in_d_co_related):
                                 co_relate(in_name, co_related, existing_cross_items_of_variable)
 
-        # output fields
-        if enable_1st_order_derivative:
-            for out_idx_in_idx, name, var_type in first_order_info:
-                out_idx, in_idx = out_idx_in_idx
-                graph_d_out_d_in = \
-                    GraphDerivative(output_variables[out_idx].nick_name, [input_variables[in_idx].nick_name, ])
-                expression = get_product_expression([graph_d_out_d_in, ])
-                if expression == '':
-                    expression = '0'
-                lines.append(_indent + '*' + _graph_output_prefix + name + '=' +
-                             expression + ';')
+        # Figure out which derivative output channel has been silenced
+        # 2 ways of silenced: it is not differentiable, it is zeroed.
+        constant_derivative_outputs: Dict[Tuple, float] = {}
 
-        if enable_2nd_order_derivative:
-            for out_idx_in_idx_1_in_idx_2, name, var_type in second_order_info:
-                out_idx, in_idx_1, in_idx_2 = out_idx_in_idx_1_in_idx_2
-                graph_d2_out_d_in_1_d_in_2 = \
-                    GraphDerivative(output_variables[out_idx].nick_name,
-                                    [input_variables[in_idx_1].nick_name,
-                                     input_variables[in_idx_2].nick_name])
-                expression = get_product_expression([graph_d2_out_d_in_1_d_in_2, ])
-                if expression == '':
-                    expression = '0'
-                lines.append(_indent + '*' + _graph_output_prefix + name + '=' +
-                             expression + ';')
+        full_output_channels = _full_output_channels_with_derivatives(len(input_variables), len(output_variables),
+                                                                      option.enable_1st_order_derivative,
+                                                                      option.enable_2nd_order_derivative)
 
+        def graph_name_of_output_channel(out_channel: Tuple):
+            assert len(out_channel) in {1, 2, 3}
+            if len(out_channel) == 1:
+                return output_variables[out_channel[0]].nick_name
+            else:
+                return get_graph_derivative_name(
+                    output_variables[out_channel[0]].nick_name,
+                    [input_variables[in_idx].nick_name for in_idx in out_channel[1:]])
+
+        for channel in full_output_channels:
+            assert len(channel) in {1, 2, 3}
+            if len(channel) > 1:
+                fully_differentiable = \
+                    output_variables[channel[0]].is_differentiable() and all(
+                        [input_variables[in_idx].is_differentiable() for in_idx in channel[1:]])
+
+                if not fully_differentiable:
+                    constant_derivative_outputs[channel] = 0
+                    continue
+
+                graph_name = graph_name_of_output_channel(channel)
+                if manager.is_constant(graph_name):
+                    constant_derivative_outputs[channel] = manager.get_constant_value(graph_name)
+
+        # Determine the function head
+        # TODO( fill out const references)
+        const_references = []
+
+        function_head = 'void ' + option.decorate(self.name) + "("
+
+        # inputs:
+        for input_var in input_variables:
+            interface_name = input_var.nick_name
+            interface_type = input_var.var_type
+            comment = "/*state*/" if input_var.is_differentiable() else "/*config*/"
+            function_head += Variable.const_reference(interface_type) + ' ' + interface_name + comment + ','
+
+        # outputs:
+        full_output_channels = _full_output_channels_with_derivatives(len(input_variables), len(output_variables),
+                                                                      option.enable_1st_order_derivative,
+                                                                      option.enable_2nd_order_derivative)
+
+        for channel in full_output_channels:
+            if channel in constant_derivative_outputs:
+                continue
+            graph_name = graph_name_of_output_channel(channel)
+            interface_name = _graph_output_prefix + graph_name
+            interface_type = output_variables[channel[0]].var_type
+
+            function_head += interface_type + "* " + interface_name + ","
+            lines.append(_indent + '*' + interface_name + '=' +
+                         graph_name + ';')
+
+        if function_head[-1] == ',':
+            function_head = function_head[:-1]
+        function_head += ") {"
         lines.append("}")
-        return lines
+
+        return [function_head] + lines, constant_derivative_outputs
+
+    def create_graph_function(self, input_variables: List[Variable],
+                              output_variables: List[Variable],
+                              name: str = None):
+        if name is None:
+            name = self.name
+        assert _is_valid_cpp_name(name)
+
+        input_spec = [input_var.var_type for input_var in input_variables]
+        output_spec = [output_var.var_type for output_var in output_variables]
+
+        implementations = []
+        constant_derivative_outputs = {}
+
+        for option in _all_options:
+            implementation, const_der_out = self.print_derivative_definition(input_variables, output_variables, option)
+            implementations.append(implementation)
+            for channel, value in const_der_out.items():
+                # Skip different option's consistency check
+                constant_derivative_outputs[channel] = value
+
+        return GraphFunction(input_spec, output_spec, name, constant_derivative_outputs,
+                             implementations)
 
     def create_new_variable(self, name: str):
         new_var = self.create_un_named_variable()
@@ -1250,19 +1537,14 @@ def radius_func(a, b):
 g = Graph(name='Radius')
 
 x, y = g.state_inputs(['x', 'y'], 'double')
-radius = SymPyFunction(radius_func)
+c = g.config_inputs(['c'], 'Gref')
+radius = x ** 2 + (y ** 2)
 
-z = radius(x, y)
+radius.set_name('r')
 
-"""
-a = x
-b = y
-tp = (a**2 +b**2)**0.5 +  a * b
-z = tp * a**0.5
-"""
+create_rad = g.create_graph_function([x, c, y], [radius], 'ComputeRad')
 
-z.set_name('z')
-lines = g.print_derivative_definition([z], True, True)
+lines = create_rad.print_definition()
 s = ''
 for line in lines:
     s += line

@@ -13,9 +13,9 @@ namespace geom {
 		constexpr Vec2(T x, T y) :x(x), y(y) {}
 
 		inline void Rotate90() {
-T old_x = x;
-x = -y;
-y = x;
+			T old_x = x;
+			x = -y;
+			y = x;
 		}
 
 		inline void Rotate180() {
@@ -72,6 +72,46 @@ y = x;
 	inline Vec2<T> operator*(const Vec2<T>& vec, R scalar) {
 		return Vec2{ vec.x * scalar, vec.y * scalar };
 	}
+
+	template<typename T>
+	struct AABox2 {
+	public:
+		AABox2(T x_min, T x_max, T y_min, T y_max) :
+			x_min_(x_min),
+			x_max_(x_max),
+			y_min_(y_min),
+			y_max_(y_max) {
+			DCHECK_GE(x_max_, x_min_);
+			DCHECK_GE(y_max_, y_min_);
+		}
+
+		inline double x_min() const {
+			return x_min_;
+		}
+		inline double x_max() const {
+			return x_max_;
+		}
+		inline double XSpan() const {
+			return x_max_ - x_min_;
+		}
+
+		inline double y_min() const {
+			return y_min_;
+		}
+		inline double y_max() const {
+			return y_max_;
+		}
+		inline double YSpan() const {
+			return y_max_ - y_min_;
+		}
+
+		T x_min_ = 0.0;
+		T x_max_ = 0.0;
+		T y_min_ = 0.0;
+		T y_max_ = 0.0;
+	};
+	using AABox2d = AABox2<double>;
+
 
 	template <typename T>
 	class HalfPlane {
@@ -629,5 +669,6 @@ y = x;
 	// 休息： 一小时。
 	
 	using HalfPlaneD = HalfPlane<double>;
-} // namespace
 
+	using Vec2d = Vec2<double>;
+} // namespace

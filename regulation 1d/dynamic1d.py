@@ -25,11 +25,11 @@ class Dynamic1d:
 
     def __eq__(self, other):
         return all([self.max_jerk == other.max_jerk,
-                     self.min_jerk == other.min_jerk,
-                     self.max_acc == other.max_acc,
-                     self.min_acc == other.min_acc,
-                     self.min_speed == other.min_speed,
-                     self.max_speed == other.max_speed])
+                    self.min_jerk == other.min_jerk,
+                    self.max_acc == other.max_acc,
+                    self.min_acc == other.min_acc,
+                    self.min_speed == other.min_speed,
+                    self.max_speed == other.max_speed])
 
     def clamp_state(self, s, v, a) -> StateType:
         return s, clamp(v, self.min_speed, self.max_speed), clamp(a, self.min_acc, self.max_acc)
@@ -97,7 +97,7 @@ class Dynamic1d:
             return s + v * t + 0.5 * self.min_acc * (t ** 2), v + self.min_acc * t, self.min_acc
         elif analytical_type == AnaType.v_free_a_free:
             return s + v * t + 0.5 * a * (t ** 2) + (1.0 / 6.0) * jerk * (t ** 3), v + a * t + 0.5 * jerk * (
-                        t ** 2), a + jerk * t
+                    t ** 2), a + jerk * t
         else:
             assert False, "Invalid type"
 

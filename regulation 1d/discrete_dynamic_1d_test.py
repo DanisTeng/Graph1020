@@ -1,7 +1,7 @@
 from discrete_dynamic_1d import *
 from random import seed
 
-_debug_plot = False
+_debug_plot = True
 if _debug_plot:
     from matplotlib import pyplot as plt
 
@@ -105,9 +105,10 @@ def test_reachability():
         to_states = dd0.state_transition(from_state_id, control_id)
 
         for to_state in to_states:
-            brs = dd0.backward_reachable_states(to_state, control_id)
-            assert from_state_id in brs
+            assert control_id in dd0.transition_controls(from_state_id, to_state)
 
+            brs = dd0.back_transition(to_state, control_id)
+            assert from_state_id in brs
 
     for i in range(100):
         s = random_float(-100., 100., )
@@ -118,13 +119,13 @@ def test_reachability():
         s, v, a = d0.clamp_state(s, v, a)
         to_state_id = dd0.s_to_sid(s), dd0.v_to_vid(v), dd0.a_to_aid(a)
         control_id = dd0.jerk_round_to_control_id(j)
-        from_states = dd0.backward_reachable_states(to_state_id, control_id)
+        from_states = dd0.back_transition(to_state_id, control_id)
 
         for from_state in from_states:
+            assert control_id in dd0.transition_controls(from_state, to_state_id)
+
             frs = dd0.state_transition(from_state, control_id)
             assert to_state_id in frs
-
-
 
 
 if __name__ =="__main__":

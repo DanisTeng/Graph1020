@@ -11,13 +11,13 @@ from time import time
 
 class DiscreteDynamic1dParam:
     def __init__(self):
-        self.dense_sample_dv = 0.01
-        self.dense_sample_da = 0.01
+        self.dense_sample_dv = 0.05
+        self.dense_sample_da = 0.05
         self.ds = 0.1
         self.dv = 0.1
-        self.da = 0.1
+        self.da = 0.2
         self.dt = 0.5
-        self.dj = 0.2
+        self.dj = 0.4
 
     def __eq__(self, other: "DiscreteDynamic1dParam"):
         return all([
@@ -32,6 +32,8 @@ class DiscreteDynamic1dParam:
 
 
 DiscreteDynamic1dLog = True
+
+
 class DiscreteDynamic1d:
     StateId = Tuple[int, int, int]
     ControlId = int
@@ -41,16 +43,42 @@ class DiscreteDynamic1d:
 
     # Transition control id, and the possible states that can be reached
     # from current state using such control.
-    ForwardReachableSet = Dict[ControlId, Set[StateId]]
+
+    # a more efficient way of storage: from reachable state to control id range.
+    # There is a fact: when you reach state by j= 3 and j =5, you can reach it by j=4 as well.
+    # Assumption 1
+    # Proof: 线性系统的叠加性... 这个不一定对， 如果不对，就用多个 interval
+    # 32
+    # 620452 几乎是对的, 所以我们完全可以近似这件事
+
+    class JidSingleSet:
+        def __init__(self, jid: int):
+            self.min_jid = jid
+            self.max_jid = jid
+
+        def add(self, new_id):
+            """
+            Assume it is always a single interval
+            :param new_id:
+            :return:
+            """
+            self.min_jid = min(self.min_jid, new_id)
+            self.max_jid = max(self.max_jid, new_id)
+
+        def __contains__(self, jid: int):
+            return self.min_jid <= jid <= self.max_jid
+
+
+    ForwardReachableSet = Dict[StateId, JidSingleSet]
 
     # Transition control id, and the possible states that can lead to
     # current state using such control.
-    BackwardReachableSet = Dict[ControlId, Set[StateId]]
+    BackwardReachableSet = Set[StateId]
 
-    CacheSuffix = ".dd1d"
+    CacheSuffix = ".dd1dx"
     CacheDir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "discrete_dynamic1d_cache")
 
-    def __init__(self, dynamic1d: Dynamic1d,  param: DiscreteDynamic1dParam, load_from_cache=True, dump_to_cache=True):
+    def __init__(self, dynamic1d: Dynamic1d, param: DiscreteDynamic1dParam, load_from_cache=True, dump_to_cache=True):
         self.dynamic1d = dynamic1d
         self.param = param
         # jerks, discrete controls including pure 0.0 as choice.
@@ -130,55 +158,56 @@ class DiscreteDynamic1d:
                 except:
                     self.log("dump to cache failed.")
 
-
     @staticmethod
     def log(string: str):
         if DiscreteDynamic1dLog:
-            print("DiscreteDynamic1d:" + string)
+            print("DiscreteDynamic1d:" + string, flush=True)
 
     def _build_frs_brs_from_scratch(self):
-        self.frs_of_0_vid_aid = {}
-        self.brs_of_0_vid_aid = {}
+        VidAid = Tuple[int, int]
+        self.frs_of_0_vid_aid: Dict[VidAid, DiscreteDynamic1d.ForwardReachableSet] = {}
+        self.brs_of_0_vid_aid: Dict[VidAid, DiscreteDynamic1d.BackwardReachableSet] = {}
         self.log("building forward reachable set")
 
         for vid in range(len(self.v_partition)):
-            self.log("frs vid = %d, percent = %.2f" % (vid,vid / (len(self.v_partition)-1)))
+            self.log("frs vid = %d, percent = %.2f" % (vid, vid / (len(self.v_partition) - 1)))
             for aid in range(len(self.a_partition)):
                 from_state_id = 0, vid, aid
                 self.frs_of_0_vid_aid[(vid, aid)] = {}
                 frs = self.frs_of_0_vid_aid[(vid, aid)]
 
                 for jid in range(self.min_jid, self.max_jid + 1):
-                    frs[jid] = self.calculate_forward_reachable_states(from_state_id, jid)
+                    reachable_states = self.calculate_forward_reachable_states(from_state_id, jid)
+                    for state in reachable_states:
+                        if state in frs:
+                            frs[state].add(jid)
+                        else:
+                            frs[state] = self.JidSingleSet(jid)
 
-        self.log("building forward reachable set")
+        self.log("building backward reachable set")
         for vid in range(len(self.v_partition)):
             self.log("brs vid = %d, percent = %.2f" % (vid, vid / (len(self.v_partition) - 1)))
             for aid in range(len(self.a_partition)):
                 assert (vid, aid) in self.frs_of_0_vid_aid
                 frs = self.frs_of_0_vid_aid[(vid, aid)]
 
-                for control_id, reachable_states in frs.items():
-                    # [0, vid, aid] by control_id reaches the reachable_states
+                for to_state_id, jerk_set in frs.items():
+                    # [0, vid, aid] reaches [to_sid, to_vid, to_aid] by control_id \in jerk_set
+                    # <=> [-to_sid, vid, aid] reaches [0, to_vid, to_aid]  by control_id \in jerk_set
+                    to_sid, to_vid, to_aid = to_state_id
 
-                    for to_state_id in reachable_states:
-                        # [0, vid, aid] by control_id reaches [to_sid, to_vid, to_aid]
-                        # <=> [-to_sid, vid, aid] by control_id reaches [0, to_vid, to_aid]
-                        to_sid, to_vid, to_aid = to_state_id
+                    if (to_vid, to_aid) not in self.brs_of_0_vid_aid:
+                        self.brs_of_0_vid_aid[(to_vid, to_aid)] = set()
 
-                        if (to_vid, to_aid) not in self.brs_of_0_vid_aid:
-                            self.brs_of_0_vid_aid[(to_vid, to_aid)] = {}
-                        brs_of_to_state = self.brs_of_0_vid_aid[(to_vid, to_aid)]
+                    brs_of_to_state = self.brs_of_0_vid_aid[(to_vid, to_aid)]
+                    brs_of_to_state.add((-to_sid, vid, aid))
 
-                        if control_id not in brs_of_to_state:
-                            brs_of_to_state[control_id] = set()
-                        brs_of_to_state_at_control_id = brs_of_to_state[control_id]
 
-                        brs_of_to_state_at_control_id.add((-to_sid, vid, aid))
 
     def _try_load_frs_brs_from_cache(self, cache_dir: str):
         for name in os.listdir(cache_dir):
-            if len(name) > 4 and name[-5:] == DiscreteDynamic1d.CacheSuffix:
+            sn = len(DiscreteDynamic1d.CacheSuffix)
+            if len(name) > sn and name[-sn:] == DiscreteDynamic1d.CacheSuffix:
                 loaded = False
                 with open(os.path.join(cache_dir, name), "rb") as fp:
                     try:
@@ -221,10 +250,10 @@ class DiscreteDynamic1d:
         v_interval = self.v_interval(vid)
         a_interval = self.a_interval(aid)
 
-        num_v_sample = max(math.floor((v_interval.end - v_interval.begin)/self.param.dense_sample_dv), 1) + 1
+        num_v_sample = max(math.floor((v_interval.end - v_interval.begin) / self.param.dense_sample_dv), 1) + 1
         v_step = (v_interval.end - v_interval.begin) / (num_v_sample - 1)
 
-        num_a_sample = max(math.floor((a_interval.end - a_interval.begin)/self.param.dense_sample_da), 1) + 1
+        num_a_sample = max(math.floor((a_interval.end - a_interval.begin) / self.param.dense_sample_da), 1) + 1
         a_step = (a_interval.end - a_interval.begin) / (num_a_sample - 1)
 
         reachable_states = set()
@@ -256,7 +285,6 @@ class DiscreteDynamic1d:
 
         return reachable_states
 
-                # some CONTI shit
 
     def s_to_sid(self, s: float) -> int:
         return self.s_partition.get_index_from_value(s)
@@ -275,6 +303,21 @@ class DiscreteDynamic1d:
 
     def control_id_to_jerk(self, control_id: ControlId):
         return control_id * self.dj
+
+    def jid_set_to_jerk_min_max(self, jid_set: JidSingleSet)->Tuple[float,float]:
+        return self.control_id_to_jerk(jid_set.min_jid), self.control_id_to_jerk(jid_set.max_jid)
+
+    def all_control_ids(self):
+        """
+        :return: control ids from small to big
+        """
+        return list(range(self.min_jid, self.max_jid+1))
+
+    def all_vids(self):
+        return list(range(len(self.v_partition)))
+
+    def all_aids(self):
+        return list(range(len(self.a_partition)))
 
     # === Make sure state valid before calling ===
     def s_interval(self, sid: int):
@@ -312,6 +355,28 @@ class DiscreteDynamic1d:
     def control_valid(self, control_id: ControlId):
         return self.min_jid <= control_id <= self.max_jid
 
+    def transition_controls(self,from_id: StateId, to_id:StateId)->Optional[JidSingleSet]:
+        """
+        :param from_id:
+        :param to_id:
+        :param control_id:
+        :return:
+        """
+        sid, vid, aid = from_id
+        to_sid, to_vid, to_aid = to_id
+        # (sid, vid, aid) transits to (to_sid, to_vid, to_aid) by control id
+        # <=> (0, vid, aid) transits to (to_sid-sid, to_vid, to_aid) by control id
+
+        assert (vid, aid) in self.frs_of_0_vid_aid
+        frs = self.frs_of_0_vid_aid[(vid, aid)]
+        #
+        to_state_0 = to_sid - sid, to_vid, to_aid
+
+        if to_state_0 not in frs:
+            return None
+
+        return frs[to_state_0]
+
     def state_transition(self, state_id: StateId, control_id: ControlId) -> Set[StateId]:
         """
         :param state_id:
@@ -323,36 +388,103 @@ class DiscreteDynamic1d:
         assert (vid, aid) in self.frs_of_0_vid_aid
 
         frs = self.frs_of_0_vid_aid[(vid, aid)]
-        assert control_id in frs
 
         result = set()
 
-        for res_id in frs[control_id]:
+        for res_id, jerk_set in frs.items():
+            if control_id in jerk_set:
+                result.add((res_id[0] + sid, res_id[1], res_id[2]))
+
+        return result
+
+    def forward_reachable_states(self, state_id: StateId) -> Set[StateId]:
+        assert self.state_valid(state_id)
+        sid, vid, aid = state_id
+        assert (vid, aid) in self.frs_of_0_vid_aid
+
+        frs = self.frs_of_0_vid_aid[(vid, aid)]
+
+        result = set()
+
+        for res_id in frs.keys():
             result.add((res_id[0] + sid, res_id[1], res_id[2]))
 
         return result
 
-    def backward_reachable_states(self, state_id: StateId, control_id: ControlId)->Set[StateId]:
+    def back_transition(self, state_id: StateId, control_id: ControlId) -> Set[StateId]:
+        """
+        Find all back states such that .state_transition(back_state, control_id) contains state_id.
+        :param state_id:
+        :param control_id:
+        :return:
+        """
         assert self.state_valid(state_id)
         sid, vid, aid = state_id
 
         if (vid, aid) not in self.brs_of_0_vid_aid:
             return set()
-
         brs = self.brs_of_0_vid_aid[(vid, aid)]
 
-        if control_id not in brs:
-            return set()
-
-        # result element by control id transits to [0, vid, aid].
-        # <=> result element + sid by control id transits to [sid, vid, aid].
+        # (res_sid, res_vid, res_aid) transits to (0, vid, aid) by control id
+        # <=> (res_sid+sid, res_vid, res_aid) transits to (sid, vid, aid) by control id
+        # <=> (0, res_vid, res_aid) transits to (-res_sid, vid, aid) by control id
 
         result = set()
 
-        for res_id in brs[control_id]:
+        for res_id in brs:
+            res_vid_aid = res_id[1], res_id[2]
+            assert res_vid_aid in self.frs_of_0_vid_aid
+
+            frs = self.frs_of_0_vid_aid[res_vid_aid]
+            assert (-res_id[0], vid, aid) in frs
+
+            if control_id not in frs[(-res_id[0], vid, aid)]:
+                continue
+
             result.add((res_id[0] + sid, res_id[1], res_id[2]))
 
         return result
 
 
+
+    def backward_reachable_states(self, state_id: StateId) -> Set[StateId]:
+        assert self.state_valid(state_id)
+        sid, vid, aid = state_id
+
+        if (vid, aid) not in self.brs_of_0_vid_aid:
+            return set()
+        brs = self.brs_of_0_vid_aid[(vid, aid)]
+
+        # (res_sid, res_vid, res_aid) transits to (0, vid, aid) by control id
+        # <=> (res_sid+sid, res_vid, res_aid) transits to (sid, vid, aid) by control id
+        # <=> (0, res_vid, res_aid) transits to (-res_sid, vid, aid) by control id
+
+        result = set()
+
+        for res_id in brs:
+            result.add((res_id[0] + sid, res_id[1], res_id[2]))
+
+        return result
+
+
+
+    def state_debug_info(self, state: StateId) -> str:
+        if not self.state_valid(state):
+            return "Invalid state."
+        res = "StateId(%5d,%5d,%5d):\n" % state
+        sid, vid, aid = state
+
+        def interval_string(interval: Interval):
+            return ("(" if interval.begin_open else "[") + \
+                   "%6.2f, %6.2f" % (interval.begin, interval.end) + \
+                   (")" if interval.end_open else "]")
+
+        res += "  s ∈ " + interval_string(self.s_interval(sid)) + "\n"
+        res += "  v ∈ " + interval_string(self.v_interval(vid)) + "\n"
+        res += "  a ∈ " + interval_string(self.a_interval(aid)) + "\n"
+
+        return res
+
+    def state_name_string(self, state: StateId)->str:
+        return "(%d,%d,%d)" % state
 

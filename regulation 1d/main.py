@@ -1,8 +1,8 @@
 from two_path_graph_debug_viewer import TwoPathGraphViewer
-from path_based_graph import *
+from two_path_graph import *
 from path import StraightPath
 from geometry import *
-
+import time
 
 def test_two_path_graph_viewer():
     vehicle = Vehicle()
@@ -46,9 +46,30 @@ def test_two_path_graph_viewer():
 
     TwoPathGraphViewer(tpg, ((0, 2, 0), (0, 2, 0))).main_loop()
 
-    # TODO CONTINUE:
-    # 提交MR
+
+def test_initial_collision_set():
+    vehicle = Vehicle()
+    vehicle.max_lng_speed = 12.0
+    a1_path = StraightPath(Vec2(0.0, 0.0), Vec2.form_unit(1.57))
+
+    #a2_angle = 1.42
+    a2_angle = 0.0
+    a2_path = StraightPath(Vec2(0.0, 0.0), Vec2.form_unit(a2_angle))
+    single_path_graph_param = SinglePathParam()
+    single_path_graph_param.dd1d_param.da = 2.0
+    single_path_graph_param.dd1d_param.dv = 1.0
+    single_path_graph_param.dd1d_param.dj = 4.0
+    single_path_graph_param.dd1d_param.ds = 0.25
+
+    a1 = SingleAgentMeta(a1_path, vehicle, single_path_graph_param)
+    a2 = SingleAgentMeta(a2_path, vehicle, single_path_graph_param)
+    t0 = time.perf_counter()
+    tpg = TwoPathGraphEx(a1, a2)
+    print(time.perf_counter() - t0, " seconds elapsed.")
+
+    TwoPathGraphViewer(tpg, ((0, 2, 0), (0, 2, 0))).main_loop()
 
 
 if __name__ == "__main__":
-    test_two_path_graph_viewer()
+    # test_two_path_graph_viewer()
+    test_initial_collision_set()

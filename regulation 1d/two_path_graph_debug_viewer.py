@@ -1,11 +1,11 @@
 import tkinter as tk
+import tkinter.font as font
 import random
 import time, math
 
-import path_based_graph
 import vehicle
 from path import PathBase
-from path_based_graph import TwoPathGraph
+from two_path_graph import TwoPathGraph, TwoPathGraphEx, RegulationBase
 from vehicle import Vehicle
 from discrete_dynamic_1d import DiscreteDynamic1d
 from typing import Optional, List, Set, Tuple, Literal, Callable
@@ -319,7 +319,7 @@ class TwoPathGraphViewer:
                         continue
 
                     control_name = " (%3.1f,%3.1f) , (%3.1f, %3.1f)" % (
-                    a1_jerk_range[0], a1_jerk_range[1], a2_jerk_range[0], a2_jerk_range[1])
+                        a1_jerk_range[0], a1_jerk_range[1], a2_jerk_range[0], a2_jerk_range[1])
                     item = graph.state_name_string(state_to_show).ljust(37) + " | " + control_name
                     self.state_list.insert("end", item)
                     if self.state_list.size() >= self._MaxStateListSize:
@@ -378,6 +378,9 @@ class TwoPathGraphViewer:
         self.canvas.bind("<MouseWheel>", self.on_scroll_canvas)
         self.drag_canvas_start_pixel = None
         self.canvas.bind("<KeyPress-f>", self.on_canvas_focus)
+        self.canvas.bind("<KeyPress-z>", self.on_canvas_zoom_in)
+        self.canvas.bind("<KeyPress-x>", self.on_canvas_zoom_out)
+
         self.canvas.grid(row=0, column=0, sticky=tk.NSEW)
 
         self.state_info_text_box = tk.Text(self.main_window, width=40, name="state_info_text_box")
@@ -414,6 +417,18 @@ class TwoPathGraphViewer:
         self.frame_count = 0
         self.started = False
 
+        # keyboard adjustment for a1, a2 pos and a2 speed a2 acc.
+        # w, s for a1 s, a, d for a2 s.
+
+        self.canvas.bind("<KeyPress-Up>", self.on_key_up)
+        self.canvas.bind("<KeyPress-Down>", self.on_key_down)
+        self.canvas.bind("<KeyPress-Left>", self.on_key_left)
+        self.canvas.bind("<KeyPress-Right>", self.on_key_right)
+        self.canvas.bind("<KeyPress-w>", self.on_key_w)
+        self.canvas.bind("<KeyPress-s>", self.on_key_s)
+        self.canvas.bind("<KeyPress-d>", self.on_key_d)
+        self.canvas.bind("<KeyPress-a>", self.on_key_a)
+
     def main_loop(self):
         assert not self.started, "GUI cant be started twice"
         self.started = True
@@ -438,10 +453,58 @@ class TwoPathGraphViewer:
 
         self.update_panel()
 
+    def on_key_up(self, e):
+        # a2 speed up.
+        self.adjust_graph_state(False, sva_id=1, adjustment=1)
+
+    def on_key_down(self, e):
+        # a2 speed down.
+        self.adjust_graph_state(False, sva_id=1, adjustment=-1)
+
+    def on_key_left(self, e):
+        # a2 acc down.
+        self.adjust_graph_state(False, sva_id=2, adjustment=-1)
+
+    def on_key_right(self, e):
+        # a2 acc up.
+        self.adjust_graph_state(False, sva_id=2, adjustment=1)
+
+    def on_key_w(self, e):
+        # a1 s up.
+        self.adjust_graph_state(True, sva_id=0, adjustment=1)
+
+    def on_key_s(self, e):
+        # a1 s down.
+        self.adjust_graph_state(True, sva_id=0, adjustment=-1)
+
+    def on_key_d(self, e):
+        # a2 s up.
+        self.adjust_graph_state(False, sva_id=0, adjustment=1)
+
+    def on_key_a(self, e):
+        # a2 s down.
+        self.adjust_graph_state(False, sva_id=0, adjustment=-1)
+
+    def adjust_graph_state(self, is_a1=False, sva_id=0, adjustment=1):
+        assert self.gui_state.graph_state is not None
+        assert sva_id in [0, 1, 2]
+        if is_a1:
+            s1, s2 = self.gui_state.graph_state
+            new_s1 = list(s1)
+            new_s1[sva_id] += adjustment
+            new_s1 = tuple(new_s1)
+            self.go_to_state((new_s1, s2))
+        else:
+            s1, s2 = self.gui_state.graph_state
+            new_s2 = list(s2)
+            new_s2[sva_id] += adjustment
+            new_s2 = tuple(new_s2)
+            self.go_to_state((s1, new_s2))
+
     def log_to_gui(self, string: str):
         self.log_bar.configure(text=string)
 
-    def go_to_state(self, state_id: path_based_graph.TwoPathGraph.StateId):
+    def go_to_state(self, state_id: TwoPathGraph.StateId):
         if self.gui_state.graph is None:
             self.log_to_gui("No graph")
 
@@ -504,6 +567,16 @@ class TwoPathGraphViewer:
 
         for _ in range(tick):
             self.gui_state.pixel_per_meter *= gain
+        self.gui_state.pixel_per_meter = \
+            clamp(self.gui_state.pixel_per_meter, self._display_pixel_per_meter_min, self._display_pixel_per_meter_max)
+
+    def on_canvas_zoom_in(self, e):
+        self.gui_state.pixel_per_meter *= 1.25
+        self.gui_state.pixel_per_meter = \
+            clamp(self.gui_state.pixel_per_meter, self._display_pixel_per_meter_min, self._display_pixel_per_meter_max)
+
+    def on_canvas_zoom_out(self, e):
+        self.gui_state.pixel_per_meter *= 0.8
         self.gui_state.pixel_per_meter = \
             clamp(self.gui_state.pixel_per_meter, self._display_pixel_per_meter_min, self._display_pixel_per_meter_max)
 
@@ -640,6 +713,115 @@ class TwoPathGraphViewer:
 
         draw_paths()
         draw_vehicles()
+
+        def draw_a2_sweep(color: str):
+            if not hasattr(self.gui_state.graph, "a2_sweep_region_by_a1"):
+                return
+            a1_sva_id, a2_sva_id = self.gui_state.graph_state
+            region = self.gui_state.graph.a2_sweep_region_by_a1(a1_sva_id[1], a2_sva_id[1], a2_sva_id[0])
+
+            pts = [self.pos2canvas(pt.x, pt.y) for pt in region.vertices]
+            if pts:
+                pts.append(pts[0])
+            self.canvas.create_line(*pts, fill=color)
+
+        draw_a2_sweep("blue")
+
+        def draw_regulation(reg_base: RegulationBase, y0=0, x0=0, height=100, width=100) -> int:
+            if self.gui_state.graph_state is None:
+                return 0
+
+            a1_state, a2_state = self.gui_state.graph_state
+
+            dd1d = self.gui_state.graph.a1.discrete_dynamic if reg_base.is_a1() else self.gui_state.graph.a2.discrete_dynamic
+            a_range = dd1d.all_aids()
+            v_range = dd1d.all_vids()
+            j_min = dd1d.min_jid
+            j_max = dd1d.max_jid
+
+            text_height = 20
+            text_width = 40
+
+            table_origin = x0 + text_width, y0 + 2 * text_height
+
+            dx = int(width / len(a_range))
+            dx = max(dx, 3)
+
+            dy = int(height / len(v_range))
+            dy = max(dy, 3)
+
+            xspan = len(a_range) * dx
+            yspan = len(v_range) * dy
+
+            # draw table
+            for a_ind in range(len(a_range)):
+                for v_ind in range(len(v_range)):
+                    if reg_base.is_a1():
+                        state_tpg = (a1_state[0], v_range[v_ind], a_range[a_ind]), a2_state
+                    else:
+                        state_tpg = a1_state, (a2_state[0], v_range[v_ind], a_range[a_ind])
+
+                    p00 = table_origin[0] + a_ind * dx, table_origin[1] + v_ind * dy
+                    p11 = p00[0] + dx, p00[1] + dy
+
+                    # determine color
+                    jid_ok_num = 0
+                    prev_ok = None
+                    rise = False
+                    drop = False
+                    # 5 types: fully ok, fully banned, ban acc, ban brake
+                    # mixed ban.
+                    for jid in range(j_min, j_max + 1):
+                        jid_ok = reg_base.can_do(state_tpg, jid)
+                        if jid_ok:
+                            jid_ok_num += 1
+                        if prev_ok is not None:
+                            if prev_ok and not jid_ok:
+                                drop = True
+                            if not prev_ok and jid_ok:
+                                rise = True
+                        prev_ok = jid_ok
+                    if jid_ok_num == j_max + 1 - j_min:
+                        # fully ok
+                        color = "#00ff00"
+                    elif jid_ok_num == 0:
+                        # fully baned
+                        color = "#000000"
+                    else:
+                        r = jid_ok_num * 1.0 / (j_max + 1 - j_min)
+                        if drop and not rise:
+                            # ban acc
+                            color = lerp_color("#44ff00", "#ff0000", 1 - r)
+                        elif rise and not drop:
+                            color = lerp_color("#00ff44", "#0000ff", 1 - r)
+                        else:
+                            color = "#ff00ff"
+
+                    self.canvas.create_rectangle(*p00, *p11, fill=color, outline="")
+
+            f = font.Font(size=10)
+            a_min = dd1d.a_interval(a_range[0]).begin
+            a_max = dd1d.a_interval(a_range[-1]).end
+            v_min = dd1d.v_interval(v_range[0]).begin
+            v_max = dd1d.v_interval(v_range[-1]).end
+
+            self.canvas.create_text(x0, y0, anchor=tk.NW, text=reg_base.name(), fill="black", font=f)
+            self.canvas.create_text(table_origin[0], table_origin[1], anchor=tk.SW, text="%4.1f" % a_min, fill="black",
+                                    font=f)
+            self.canvas.create_text(table_origin[0] + xspan, table_origin[1], anchor=tk.SE, text="%4.1f" % a_max,
+                                    fill="black", font=f)
+            self.canvas.create_text(table_origin[0], table_origin[1], anchor=tk.NE, text="%4.1f" % v_min, fill="black",
+                                    font=f)
+            self.canvas.create_text(table_origin[0], table_origin[1] + yspan, anchor=tk.SE, text="%4.1f" % v_max,
+                                    fill="black", font=f)
+
+            return yspan + 2 * text_height
+
+        reg_tables_y0 = 20
+        reg_tables_x0 = 20
+        for regulation in self.gui_state.graph.regulations:
+            reg_tables_y0 += draw_regulation(regulation, reg_tables_y0, reg_tables_x0)
+            reg_tables_y0 += 10
 
     def update_panel(self):
         """
